@@ -3,6 +3,7 @@
 
 package com.azure.core.amqp.implementation;
 
+import com.azure.core.amqp.AmqpConnection;
 import com.azure.core.amqp.AmqpEndpointState;
 import com.azure.core.amqp.AmqpLink;
 import com.azure.core.amqp.AmqpRetryMode;
@@ -82,12 +83,14 @@ public class ReactorSessionTest {
     private ReactorDispatcher reactorDispatcher;
     @Mock
     private TokenManagerProvider tokenManagerProvider;
+    @Mock
+    private AmqpConnection amqpConnection;
 
     private Mono<ClaimsBasedSecurityNode> cbsNodeSupplier;
 
     @BeforeEach
     public void setup() throws IOException {
-        MockitoAnnotations.initMocks(this);
+        MockitoAnnotations.openMocks(this);
 
         this.handler = new SessionHandler(ID, HOST, ENTITY_PATH, reactorDispatcher, Duration.ofSeconds(60));
         this.cbsNodeSupplier = Mono.just(cbsNode);
@@ -106,8 +109,8 @@ public class ReactorSessionTest {
         }).when(reactorDispatcher).invoke(any());
 
         final AmqpRetryOptions options = new AmqpRetryOptions().setTryTimeout(TIMEOUT);
-        this.reactorSession = new ReactorSession(session, handler, NAME, reactorProvider, reactorHandlerProvider,
-            cbsNodeSupplier, tokenManagerProvider, serializer, options);
+        this.reactorSession = new ReactorSession(amqpConnection, session, handler, NAME, reactorProvider,
+            reactorHandlerProvider, cbsNodeSupplier, tokenManagerProvider, serializer, options);
     }
 
     @AfterEach

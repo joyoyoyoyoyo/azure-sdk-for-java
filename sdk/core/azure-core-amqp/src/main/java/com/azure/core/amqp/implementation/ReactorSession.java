@@ -3,6 +3,7 @@
 
 package com.azure.core.amqp.implementation;
 
+import com.azure.core.amqp.AmqpConnection;
 import com.azure.core.amqp.AmqpEndpointState;
 import com.azure.core.amqp.AmqpLink;
 import com.azure.core.amqp.AmqpRetryOptions;
@@ -10,6 +11,7 @@ import com.azure.core.amqp.AmqpRetryPolicy;
 import com.azure.core.amqp.AmqpSession;
 import com.azure.core.amqp.AmqpTransaction;
 import com.azure.core.amqp.ClaimsBasedSecurityNode;
+import com.azure.core.amqp.exception.AmqpException;
 import com.azure.core.amqp.implementation.handler.ReceiveLinkHandler;
 import com.azure.core.amqp.implementation.handler.SendLinkHandler;
 import com.azure.core.amqp.implementation.handler.SessionHandler;
@@ -27,9 +29,9 @@ import org.apache.qpid.proton.engine.Receiver;
 import org.apache.qpid.proton.engine.Sender;
 import org.apache.qpid.proton.engine.Session;
 import reactor.core.Disposable;
+import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.ReplayProcessor;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -51,7 +53,7 @@ public class ReactorSession implements AmqpSession {
 
     private final AtomicBoolean isDisposed = new AtomicBoolean();
     private final ClientLogger logger = new ClientLogger(ReactorSession.class);
-    private final ReplayProcessor<AmqpEndpointState> endpointStates;
+    private final Flux<AmqpEndpointState> endpointStates;
 
     private final Session session;
     private final SessionHandler sessionHandler;
@@ -64,6 +66,7 @@ public class ReactorSession implements AmqpSession {
 
     private final ReactorHandlerProvider handlerProvider;
     private final Mono<ClaimsBasedSecurityNode> cbsNodeSupplier;
+    private final Disposable.Composite connectionSubscriptions;
 
     private final AtomicReference<TransactionCoordinator> transactionCoordinator = new AtomicReference<>();
 
@@ -80,10 +83,11 @@ public class ReactorSession implements AmqpSession {
      *     operations on the message broker.
      * @param retryOptions for the session operations.
      */
-    public ReactorSession(Session session, SessionHandler sessionHandler, String sessionName, ReactorProvider provider,
-        ReactorHandlerProvider handlerProvider, Mono<ClaimsBasedSecurityNode> cbsNodeSupplier,
-        TokenManagerProvider tokenManagerProvider, MessageSerializer messageSerializer,
-        AmqpRetryOptions retryOptions) {
+    public ReactorSession(AmqpConnection amqpConnection, Session session, SessionHandler sessionHandler,
+        String sessionName, ReactorProvider provider, ReactorHandlerProvider handlerProvider,
+        Mono<ClaimsBasedSecurityNode> cbsNodeSupplier, TokenManagerProvider tokenManagerProvider,
+        MessageSerializer messageSerializer, AmqpRetryOptions retryOptions) {
+
         this.session = session;
         this.sessionHandler = sessionHandler;
         this.handlerProvider = handlerProvider;
@@ -103,7 +107,30 @@ public class ReactorSession implements AmqpSession {
                     sessionName, state);
                 return AmqpEndpointStateUtil.getConnectionState(state);
             })
-            .subscribeWith(ReplayProcessor.cacheLastOrDefault(AmqpEndpointState.UNINITIALIZED));
+            .cache(1);
+
+        this.connectionSubscriptions = Disposables.composite(
+            amqpConnection.getEndpointStates().subscribe(state -> {
+                },
+                error -> {
+                    if (error instanceof AmqpException) {
+                        final AmqpException amqpException = (AmqpException) error;
+                        final ErrorCondition condition = new ErrorCondition(
+                            Symbol.getSymbol(amqpException.getErrorCondition().getErrorCondition()),
+                            amqpException.getMessage());
+                        dispose(condition);
+                    } else {
+                        logger.warning("Exception was not an AmqpException.", error);
+                        dispose(new ErrorCondition(Symbol.getSymbol("connection-error"), error.getMessage()));
+                    }
+                }, () -> {
+                    logger.verbose("Connection states closed. Disposing normally.");
+                    dispose();
+                }),
+            amqpConnection.getShutdownSignals().subscribe(signal -> {
+                logger.verbose("Connection shutdown signal. Disposing of children.");
+                dispose();
+            }));
 
         session.open();
     }
@@ -135,19 +162,12 @@ public class ReactorSession implements AmqpSession {
             return;
         }
 
-        logger.info("connectionId[{}], sessionId[{}], errorCondition[{}]: Disposing of session.",
-            sessionHandler.getConnectionId(), sessionName, errorCondition != null ? errorCondition : NOT_APPLICABLE);
-
-        if (session.getLocalState() != EndpointState.CLOSED) {
-            session.close();
-
-            if (session.getCondition() == null) {
-                session.setCondition(errorCondition);
-            }
+        try {
+            provider.getReactorDispatcher().invoke(() -> disposeWork(errorCondition));
+        } catch (IOException e) {
+            logger.warning("Error occurred while scheduling work. Manually disposing.", e);
+            disposeWork(errorCondition);
         }
-
-        openReceiveLinks.forEach((key, link) -> link.dispose(errorCondition));
-        openSendLinks.forEach((key, link) -> link.dispose(errorCondition));
     }
 
     /**
@@ -220,7 +240,6 @@ public class ReactorSession implements AmqpSession {
     }
 
     /**
-     *
      * @return {@link Mono} of {@link TransactionCoordinator}
      */
     private Mono<TransactionCoordinator> createTransactionCoordinator() {
@@ -334,7 +353,7 @@ public class ReactorSession implements AmqpSession {
      * @return A new instance of an {@link AmqpLink} with the correct properties set.
      */
     protected Mono<AmqpLink> createProducer(String linkName, String entityPath, Duration timeout,
-         AmqpRetryPolicy retry, Map<Symbol, Object> linkProperties) {
+        AmqpRetryPolicy retry, Map<Symbol, Object> linkProperties) {
 
         final Target target = new Target();
         target.setAddress(entityPath);
@@ -436,13 +455,13 @@ public class ReactorSession implements AmqpSession {
         //@formatter:off
         final Disposable subscription = reactorSender.getEndpointStates().subscribe(state -> {
         }, error -> {
-                logger.info("linkName[{}]: Error occurred. Removing and disposing send link.",
-                    linkName, error);
-                removeLink(openSendLinks, linkName);
-            }, () -> {
-                logger.info("linkName[{}]: Complete. Removing and disposing send link.", linkName);
-                removeLink(openSendLinks, linkName);
-            });
+            logger.info("linkName[{}]: Error occurred. Removing and disposing send link.",
+                linkName, error);
+            removeLink(openSendLinks, linkName);
+        }, () -> {
+            logger.info("linkName[{}]: Complete. Removing and disposing send link.", linkName);
+            removeLink(openSendLinks, linkName);
+        });
         //@formatter:on
 
         return new LinkSubscription<>(reactorSender, subscription);
@@ -492,17 +511,17 @@ public class ReactorSession implements AmqpSession {
 
         final Disposable subscription = reactorReceiver.getEndpointStates().subscribe(state -> {
         }, error -> {
-                logger.info(
-                    "linkName[{}] entityPath[{}]: Error occurred. Removing receive link.",
-                    linkName, entityPath, error);
+            logger.info(
+                "linkName[{}] entityPath[{}]: Error occurred. Removing receive link.",
+                linkName, entityPath, error);
 
-                removeLink(openReceiveLinks, linkName);
-            }, () -> {
-                logger.info("linkName[{}] entityPath[{}]: Complete. Removing receive link.",
-                    linkName, entityPath);
+            removeLink(openReceiveLinks, linkName);
+        }, () -> {
+            logger.info("linkName[{}] entityPath[{}]: Complete. Removing receive link.",
+                linkName, entityPath);
 
-                removeLink(openReceiveLinks, linkName);
-            });
+            removeLink(openReceiveLinks, linkName);
+        });
 
         return new LinkSubscription<>(reactorReceiver, subscription);
     }
@@ -516,6 +535,25 @@ public class ReactorSession implements AmqpSession {
         return RetryUtil.withRetry(getEndpointStates().takeUntil(state -> state == AmqpEndpointState.ACTIVE),
             retryOptions, activeTimeoutMessage)
             .then();
+    }
+
+    private void disposeWork(ErrorCondition errorCondition) {
+        logger.info("connectionId[{}], sessionId[{}], errorCondition[{}]: Disposing of session.",
+            sessionHandler.getConnectionId(), sessionName,
+            errorCondition != null ? errorCondition : NOT_APPLICABLE);
+
+        connectionSubscriptions.dispose();
+
+        if (session.getLocalState() != EndpointState.CLOSED) {
+            session.close();
+
+            if (session.getCondition() == null) {
+                session.setCondition(errorCondition);
+            }
+        }
+
+        openReceiveLinks.forEach((key, link) -> link.dispose(errorCondition));
+        openSendLinks.forEach((key, link) -> link.dispose(errorCondition));
     }
 
     private <T extends AmqpLink> boolean removeLink(ConcurrentMap<String, LinkSubscription<T>> openLinks, String key) {
