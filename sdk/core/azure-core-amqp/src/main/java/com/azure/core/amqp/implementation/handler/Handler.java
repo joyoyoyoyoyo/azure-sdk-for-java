@@ -90,7 +90,6 @@ public abstract class Handler extends BaseHandler implements Closeable {
             return;
         }
 
-        endpointSink.next(EndpointState.CLOSED);
         endpointSink.complete();
     }
 }
