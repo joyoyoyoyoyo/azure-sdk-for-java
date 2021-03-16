@@ -85,7 +85,7 @@ class ReactorReceiverTest {
 
     @BeforeEach
     void setup() {
-        MockitoAnnotations.initMocks(this);
+        MockitoAnnotations.openMocks(this);
 
         when(cbsNode.authorize(any(), any())).thenReturn(Mono.empty());
 
@@ -143,7 +143,6 @@ class ReactorReceiverTest {
             .then(() -> receiverHandler.onLinkRemoteOpen(event))
             .expectNext(AmqpEndpointState.ACTIVE)
             .then(() -> receiverHandler.close())
-            .expectNext(AmqpEndpointState.CLOSED)
             .verifyComplete();
     }
 
